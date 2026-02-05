@@ -27,7 +27,6 @@ unsigned long lastUpdate = 0;
 const unsigned long interval = 10000;  // 10 seconds
 
 // ===== Device Vars ====
-
 const int actuatorExtendPin = 25;
 const int actuatorRetractPin = 26;
 const int fansPin = 24;
@@ -35,6 +34,9 @@ const int fansPin = 24;
 // Initialized states
 bool isFansOpen;
 bool isActuatorExtended;
+unsigned long actuatorCooldownStart = 0;
+bool cooldownActive = false;
+const unsigned long ACTUATOR_COOLDOWN_MS = 20000; // 20 seconds
 
 // ===== Setup =====
 void setup() {
@@ -207,8 +209,18 @@ void loop() {
   }
 }
 
+// ===== Actuator Control Functions =====
 
 void extendActuator() {
+  // Check if cooldown is still active
+  if (!isCooldownDone()) {
+    unsigned long remainingTime = ACTUATOR_COOLDOWN_MS - (millis() - actuatorCooldownStart);
+    Serial.print("Actuator is still in cooldown. Remaining: ");
+    Serial.print(remainingTime / 1000);
+    Serial.println(" seconds");
+    return;
+  }
+  
   if (isActuatorExtended == true) {
     Serial.println("Actuator is already extended");
     return;
@@ -218,10 +230,20 @@ void extendActuator() {
 
   digitalWrite(actuatorExtendPin, HIGH);
   isActuatorExtended = true;
-  return;
+  Serial.println("Actuator extended");
+  startActuatorCooldown();
 }
 
 void retractActuator() {
+  // Check if cooldown is still active
+  if (!isCooldownDone()) {
+    unsigned long remainingTime = ACTUATOR_COOLDOWN_MS - (millis() - actuatorCooldownStart);
+    Serial.print("Actuator is still in cooldown. Remaining: ");
+    Serial.print(remainingTime / 1000);
+    Serial.println(" seconds");
+    return;
+  }
+
   if (isActuatorExtended == false) {
     Serial.println("Actuator is already retracted");
     return;
@@ -231,32 +253,62 @@ void retractActuator() {
 
   digitalWrite(actuatorRetractPin, HIGH); 
   isActuatorExtended = false;
-  return;
+  Serial.println("Actuator retracted");
+  startActuatorCooldown();
 }
 
-void actuatorSafeTurnOff(){
+void actuatorSafeTurnOff() {
   digitalWrite(actuatorExtendPin, LOW);
   digitalWrite(actuatorRetractPin, LOW);
-  delay(500);
-  return;
+  delay(500);  // Short delay for safety - unavoidable but minimal
+  Serial.println("Actuator safe turn-off activated");
 }
+
+void startActuatorCooldown() {
+  actuatorCooldownStart = millis();
+  cooldownActive = true;
+  Serial.print("Actuator cooldown started: ");
+  Serial.print(ACTUATOR_COOLDOWN_MS / 1000);
+  Serial.println(" seconds");
+}
+
+bool isCooldownDone() {
+  if (!cooldownActive) return true;
+  
+  if (millis() - actuatorCooldownStart >= ACTUATOR_COOLDOWN_MS) {
+    cooldownActive = false;
+    Serial.println("Actuator cooldown completed");
+    return true;
+  }
+  
+  return false;
+}
+
+// ===== Fan Control Functions =====
 
 void openFans() {
   if (isFansOpen == true) {
-    Serial.println("Fans is already opened");
+    Serial.println("Fans are already opened");
     return;
   }
+
+  if (isActuatorExtended == true) {
+    Serial.println("Fans can't be activated while actuator is extended");
+    return;
+  }
+
   digitalWrite(fansPin, HIGH);
   isFansOpen = true;
-  return;
+  Serial.println("Fans are opened");
 }
 
 void closeFans() {
   if (isFansOpen == false) {
-    Serial.println("Fans is already closed");
+    Serial.println("Fans are already closed");
     return;
   }
+  
   digitalWrite(fansPin, LOW);
   isFansOpen = false;
-  return;
+  Serial.println("Fans are closed");
 }
