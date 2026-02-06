@@ -312,3 +312,99 @@ void closeFans() {
   isFansOpen = false;
   Serial.println("Fans are closed");
 }
+
+
+// ===== Notification sending function =====
+void sendNotification(const char* title, const char* body, const char* type, 
+                      const char* category, const char* trigger, const char* action,
+                      const char* priority, float temp, float hum, int rainAO, int lightAO) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  // POST to notifications collection (auto-generates document ID)
+  String url = "https://firestore.googleapis.com/v1/projects/smart-drying-iot/databases/(default)/documents/notifications";
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  // Get current UTC time for timestamps
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to get NTP time for notification");
+    http.end();
+    return;
+  }
+
+  char timestamp[30];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+  // Build JSON payload
+  StaticJsonDocument<1024> doc;
+  JsonObject fields = doc.createNestedObject("fields");
+
+  // Core Fields
+  fields["title"]["stringValue"] = title;
+  fields["body"]["stringValue"] = body;
+  fields["time"]["timestampValue"] = timestamp;
+  fields["isRead"]["booleanValue"] = false;
+
+  // Categorization
+  fields["type"]["stringValue"] = type;
+  fields["category"]["stringValue"] = category;
+
+  // Source Context
+  fields["deviceId"]["stringValue"] = "00:1A:2B:3C:4D:5E";
+  fields["trigger"]["stringValue"] = trigger;
+
+  // Action/State Data
+  fields["action"]["stringValue"] = action;
+
+  // Sensor Data (nested map)
+  JsonObject sensorData = fields["sensorData"].createNestedObject("mapValue").createNestedObject("fields");
+  sensorData["temperature"]["doubleValue"] = temp;
+  sensorData["humidity"]["doubleValue"] = hum;
+  sensorData["rainAO"]["integerValue"] = rainAO;
+  sensorData["lightAO"]["integerValue"] = lightAO;
+
+  // Metadata
+  fields["priority"]["stringValue"] = priority;
+  fields["acknowledged"]["booleanValue"] = false;
+  fields["createdAt"]["timestampValue"] = timestamp;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("\n--- Sending Notification to Firestore ---");
+  Serial.println("URL: " + url);
+  Serial.println("Payload: " + payload);
+
+  // Use POST to create new document
+  int httpCode = http.POST(payload);
+
+  Serial.print("HTTP Response Code: ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
+
+    if (httpCode == 200) {
+      Serial.println("✓ Notification sent to Firestore successfully!");
+    } else {
+      Serial.println("✗ Unexpected response code");
+    }
+  } else {
+    Serial.print("✗ Error sending notification: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  Serial.println("----------------------------------------\n");
+}
