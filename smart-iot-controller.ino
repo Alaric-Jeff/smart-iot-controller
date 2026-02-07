@@ -24,16 +24,17 @@ DHT dht(DHTPIN, DHTTYPE);
 
 // ===== Timing =====
 unsigned long lastUpdate = 0;
-const unsigned long interval = 10000;  // 10 seconds
+const unsigned long interval = 10000; // 10 seconds
 
 // ===== Device Vars ====
-const int actuatorExtendPin = 25;
-const int actuatorRetractPin = 26;
-const int fansPin = 24;
+const int actuatorExtendPin = 25;  // Relay1 control
+const int actuatorRetractPin = 26; // Relay2 control
+const int fansPin = 13; // Changed from 24 to valid GPIO
 
 // Initialized states
 bool isFansOpen;
 bool isActuatorExtended;
+
 unsigned long actuatorCooldownStart = 0;
 bool cooldownActive = false;
 const unsigned long ACTUATOR_COOLDOWN_MS = 20000; // 20 seconds
@@ -46,7 +47,6 @@ void setup() {
   pinMode(actuatorExtendPin, OUTPUT);
   pinMode(actuatorRetractPin, OUTPUT);
   actuatorSafeTurnOff();
-
   isActuatorExtended = false;
 
   pinMode(fansPin, OUTPUT);
@@ -58,12 +58,10 @@ void setup() {
 
   Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-
   Serial.println("\nWiFi connected!");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
@@ -74,7 +72,6 @@ void setup() {
   // Wait for time sync
   Serial.print("Waiting for NTP time sync");
   delay(2000);
-
   struct tm timeinfo;
   if (getLocalTime(&timeinfo)) {
     Serial.println("\nTime synced successfully");
@@ -112,12 +109,16 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   }
 
   WiFiClientSecure client;
-  client.setInsecure();  // Skip certificate verification for demo
+  client.setInsecure(); // Skip certificate verification for demo
 
   HTTPClient http;
 
   // Add updateMask query parameters
-  String url = String(FIRESTORE_URL) + "?updateMask.fieldPaths=temperature" + "&updateMask.fieldPaths=humidity" + "&updateMask.fieldPaths=rainAO" + "&updateMask.fieldPaths=light" + "&updateMask.fieldPaths=updatedAt";
+  String url = String(FIRESTORE_URL) + "?updateMask.fieldPaths=temperature" +
+               "&updateMask.fieldPaths=humidity" +
+               "&updateMask.fieldPaths=rainAO" +
+               "&updateMask.fieldPaths=light" +
+               "&updateMask.fieldPaths=updatedAt";
 
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
@@ -159,7 +160,6 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   if (httpCode > 0) {
     String response = http.getString();
     Serial.println("Response: " + response);
-
     if (httpCode == 200) {
       Serial.println("✓ Data sent to Firestore successfully!");
     } else {
@@ -192,14 +192,11 @@ void loop() {
     Serial.print("Temperature: ");
     Serial.print(temp);
     Serial.println(" °C");
-
     Serial.print("Humidity: ");
     Serial.print(hum);
     Serial.println(" %");
-
     Serial.print("Rain Sensor (AO): ");
     Serial.println(rainAO);
-
     Serial.print("Light Sensor (AO): ");
     Serial.println(lightAO);
     Serial.println("=======================");
@@ -210,7 +207,6 @@ void loop() {
 }
 
 // ===== Actuator Control Functions =====
-
 void extendActuator() {
   // Check if cooldown is still active
   if (!isCooldownDone()) {
@@ -220,17 +216,20 @@ void extendActuator() {
     Serial.println(" seconds");
     return;
   }
-  
-  if (isActuatorExtended == true) {
+
+  if (isActuatorExtended) {
     Serial.println("Actuator is already extended");
     return;
   }
 
   actuatorSafeTurnOff();
 
-  digitalWrite(actuatorExtendPin, HIGH);
+  // Both relays controlled: Relay1 HIGH (red=12V+), Relay2 LOW (black=GND)
+  digitalWrite(actuatorExtendPin, HIGH);   // Relay1: COM→NO (12V+)
+  digitalWrite(actuatorRetractPin, LOW);   // Relay2: COM→NC (GND)
+
   isActuatorExtended = true;
-  Serial.println("Actuator extended");
+  Serial.println("Actuator extending...");
   startActuatorCooldown();
 }
 
@@ -244,23 +243,26 @@ void retractActuator() {
     return;
   }
 
-  if (isActuatorExtended == false) {
+  if (!isActuatorExtended) {
     Serial.println("Actuator is already retracted");
     return;
   }
 
   actuatorSafeTurnOff();
 
-  digitalWrite(actuatorRetractPin, HIGH); 
+  // Reverse polarity: Relay1 LOW (red=GND), Relay2 HIGH (black=12V+)
+  digitalWrite(actuatorExtendPin, LOW);    // Relay1: COM→NC (GND)
+  digitalWrite(actuatorRetractPin, HIGH);  // Relay2: COM→NO (12V+)
+
   isActuatorExtended = false;
-  Serial.println("Actuator retracted");
+  Serial.println("Actuator retracting...");
   startActuatorCooldown();
 }
 
 void actuatorSafeTurnOff() {
   digitalWrite(actuatorExtendPin, LOW);
   digitalWrite(actuatorRetractPin, LOW);
-  delay(500);  // Short delay for safety - unavoidable but minimal
+  delay(500); // Short delay for safety - unavoidable but minimal
   Serial.println("Actuator safe turn-off activated");
 }
 
@@ -274,25 +276,23 @@ void startActuatorCooldown() {
 
 bool isCooldownDone() {
   if (!cooldownActive) return true;
-  
+
   if (millis() - actuatorCooldownStart >= ACTUATOR_COOLDOWN_MS) {
     cooldownActive = false;
     Serial.println("Actuator cooldown completed");
     return true;
   }
-  
   return false;
 }
 
 // ===== Fan Control Functions =====
-
 void openFans() {
-  if (isFansOpen == true) {
+  if (isFansOpen) {
     Serial.println("Fans are already opened");
     return;
   }
 
-  if (isActuatorExtended == true) {
+  if (isActuatorExtended) {
     Serial.println("Fans can't be activated while actuator is extended");
     return;
   }
@@ -303,19 +303,18 @@ void openFans() {
 }
 
 void closeFans() {
-  if (isFansOpen == false) {
+  if (!isFansOpen) {
     Serial.println("Fans are already closed");
     return;
   }
-  
+
   digitalWrite(fansPin, LOW);
   isFansOpen = false;
   Serial.println("Fans are closed");
 }
 
-
 // ===== Notification sending function =====
-void sendNotification(const char* title, const char* body, const char* type, 
+void sendNotification(const char* title, const char* body, const char* type,
                       const char* category, const char* trigger, const char* action,
                       const char* priority, float temp, float hum, int rainAO, int lightAO) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -394,7 +393,6 @@ void sendNotification(const char* title, const char* body, const char* type,
   if (httpCode > 0) {
     String response = http.getString();
     Serial.println("Response: " + response);
-
     if (httpCode == 200) {
       Serial.println("✓ Notification sent to Firestore successfully!");
     } else {
