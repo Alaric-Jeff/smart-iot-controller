@@ -27,6 +27,8 @@ DHT dht(DHTPIN, DHTTYPE);
 // ===== Timing =====
 unsigned long lastUpdate = 0;
 const unsigned long interval = 10000; // 10 seconds
+unsigned long lastActuatorPoll = 0;
+const unsigned long actuatorPollInterval = 3000; // 3 seconds
 
 // ===== Device Vars ====
 const int actuatorExtendPin = 25;  // Relay1 control
@@ -42,6 +44,7 @@ unsigned long actuatorMovementStart = 0;
 bool isActuatorMoving = false;
 String targetMovement = ""; // "extend" or "retract"
 const unsigned long ACTUATOR_MOVEMENT_TIME = 60000; // 60 seconds for complete movement
+String lastKnownTarget = ""; // Track last known target from Firestore to detect changes
 
 // Cooldown after movement completes
 unsigned long actuatorCooldownStart = 0;
@@ -263,6 +266,82 @@ void updateActuatorState(const char* state) {
   Serial.println("-------------------------------\n");
 }
 
+// ===== Poll Actuator Target from Firestore =====
+void pollActuatorTarget() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url = ACTUATOR_URL;
+
+  http.begin(client, url);
+
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String response = http.getString();
+    
+    // Parse JSON response
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (error) {
+      Serial.print("Failed to parse actuator state: ");
+      Serial.println(error.c_str());
+      http.end();
+      return;
+    }
+
+    // Extract target value from nested structure
+    // Path: fields.actuator.mapValue.fields.target.stringValue
+    if (doc["fields"]["actuator"]["mapValue"]["fields"]["target"]["stringValue"]) {
+      String newTarget = doc["fields"]["actuator"]["mapValue"]["fields"]["target"]["stringValue"].as<String>();
+      
+      Serial.print("Polled actuator target: ");
+      Serial.println(newTarget);
+
+      // Check if target changed
+      if (newTarget != lastKnownTarget && newTarget.length() > 0) {
+        Serial.println(">>> Target change detected! <<<");
+        Serial.print("Previous: ");
+        Serial.println(lastKnownTarget);
+        Serial.print("New: ");
+        Serial.println(newTarget);
+        
+        // Update last known target
+        lastKnownTarget = newTarget;
+        
+        // Execute action based on new target
+        if (newTarget == "extend") {
+          Serial.println("Executing: EXTEND");
+          extendActuator();
+        } else if (newTarget == "retract") {
+          Serial.println("Executing: RETRACT");
+          retractActuator();
+        }
+      } else if (lastKnownTarget.length() == 0) {
+        // First poll, just store the value
+        lastKnownTarget = newTarget;
+        Serial.print("Initial target state: ");
+        Serial.println(newTarget);
+      }
+    } else {
+      Serial.println("No target field found in actuator data");
+    }
+  } else {
+    Serial.print("Failed to poll actuator state. HTTP Code: ");
+    Serial.println(httpCode);
+  }
+
+  http.end();
+}
+
 // ===== Main loop =====
 void loop() {
   unsigned long now = millis();
@@ -348,6 +427,12 @@ void loop() {
         Serial.println(" seconds");
       }
     }
+  }
+
+  // Poll actuator target from Firestore every 3 seconds (non-blocking)
+  if (now - lastActuatorPoll >= actuatorPollInterval) {
+    lastActuatorPoll = now;
+    pollActuatorTarget();
   }
 
   // Regular sensor update interval
