@@ -9,8 +9,10 @@
 const char* ssid = "vivo V15";
 const char* password = "pogiako123";
 
-// ===== Firestore URL =====
+// ===== Firestore URLs =====
 const char* FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/smart-drying-iot/databases/(default)/documents/device_sensors/00:1A:2B:3C:4D:5E";
+const char* DEVICE_ID = "00:1A:2B:3C:4D:5E";
+String ACTUATOR_URL = "https://firestore.googleapis.com/v1/projects/smart-drying-iot/databases/(default)/documents/devices/" + String(DEVICE_ID);
 
 // ===== Sensor pins =====
 #define DHTPIN 23
@@ -29,15 +31,33 @@ const unsigned long interval = 10000; // 10 seconds
 // ===== Device Vars ====
 const int actuatorExtendPin = 25;  // Relay1 control
 const int actuatorRetractPin = 26; // Relay2 control
-const int fansPin = 13; // Changed from 24 to valid GPIO
+const int fansPin = 13;
 
-// Initialized states
-bool isFansOpen;
-bool isActuatorExtended;
+// Actuator states
+bool isFansOpen = false;
+bool isActuatorExtended = false;
 
+// Actuator movement timing
+unsigned long actuatorMovementStart = 0;
+bool isActuatorMoving = false;
+String targetMovement = ""; // "extend" or "retract"
+const unsigned long ACTUATOR_MOVEMENT_TIME = 60000; // 60 seconds for complete movement
+
+// Cooldown after movement completes
 unsigned long actuatorCooldownStart = 0;
 bool cooldownActive = false;
 const unsigned long ACTUATOR_COOLDOWN_MS = 20000; // 20 seconds
+
+// Rain detection
+bool rainDetected = false;
+bool rainNotificationSent = false;
+int rainThreshold = 2000; // Adjust based on your sensor (lower = more rain)
+
+// Last sensor readings (for notifications)
+float lastTemp = 0;
+float lastHum = 0;
+int lastRainAO = 0;
+int lastLightAO = 0;
 
 // ===== Setup =====
 void setup() {
@@ -101,6 +121,11 @@ int readLightAO() {
   return analogRead(LIGHT_AO);
 }
 
+bool isRaining(int rainAO) {
+  // Lower analog value = more rain detected
+  return rainAO < rainThreshold;
+}
+
 // ===== Firestore sending function =====
 void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -109,11 +134,10 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip certificate verification for demo
+  client.setInsecure();
 
   HTTPClient http;
 
-  // Add updateMask query parameters
   String url = String(FIRESTORE_URL) + "?updateMask.fieldPaths=temperature" +
                "&updateMask.fieldPaths=humidity" +
                "&updateMask.fieldPaths=rainAO" +
@@ -123,7 +147,6 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
 
-  // Get current UTC time for Firestore timestamp
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to get NTP time");
@@ -134,7 +157,6 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   char timestamp[30];
   strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
 
-  // Build JSON payload (NO "name" field)
   StaticJsonDocument<512> doc;
   JsonObject fields = doc.createNestedObject("fields");
 
@@ -151,7 +173,6 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   Serial.println("URL: " + url);
   Serial.println("Payload: " + payload);
 
-  // Use PATCH to update existing document
   int httpCode = http.PATCH(payload);
 
   Serial.print("HTTP Response Code: ");
@@ -174,18 +195,164 @@ void sendToFirestore(float temp, float hum, int rainAO, int lightAO) {
   Serial.println("----------------------------\n");
 }
 
+// ===== Actuator State Update to Firestore =====
+void updateActuatorState(const char* state) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url = ACTUATOR_URL + "?updateMask.fieldPaths=actuator.state&updateMask.fieldPaths=actuator.updatedAt";
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to get NTP time");
+    http.end();
+    return;
+  }
+
+  char timestamp[30];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+  StaticJsonDocument<512> doc;
+  JsonObject fields = doc.createNestedObject("fields");
+
+  // Create nested map structure for actuator field
+  JsonObject actuator = fields.createNestedObject("actuator")
+                              .createNestedObject("mapValue")
+                              .createNestedObject("fields");
+
+  actuator["state"]["stringValue"] = state;
+  actuator["updatedAt"]["timestampValue"] = timestamp;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.println("\n--- Updating Actuator State ---");
+  Serial.println("URL: " + url);
+  Serial.println("State: " + String(state));
+  Serial.println("Payload: " + payload);
+
+  int httpCode = http.PATCH(payload);
+
+  Serial.print("HTTP Response Code: ");
+  Serial.println(httpCode);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
+    if (httpCode == 200) {
+      Serial.println("✓ Actuator state updated successfully!");
+    } else {
+      Serial.println("✗ Unexpected response code");
+    }
+  } else {
+    Serial.print("✗ Error updating actuator state: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+  Serial.println("-------------------------------\n");
+}
+
 // ===== Main loop =====
 void loop() {
   unsigned long now = millis();
 
+  // Read all sensors
+  float temp = readTemperature();
+  float hum = readHumidity();
+  int rainAO = readRainAO();
+  int lightAO = readLightAO();
+
+  // Store for notifications
+  lastTemp = temp;
+  lastHum = hum;
+  lastRainAO = rainAO;
+  lastLightAO = lightAO;
+
+  // Check for rain and trigger retraction
+  bool currentRainStatus = isRaining(rainAO);
+  
+  if (currentRainStatus && !rainDetected) {
+    // Rain just started
+    rainDetected = true;
+    rainNotificationSent = false;
+    
+    Serial.println("\n!!! RAIN DETECTED !!!");
+    
+    // Immediately retract actuator (notification will be sent when complete)
+    retractActuator();
+    
+  } else if (!currentRainStatus && rainDetected) {
+    // Rain stopped
+    rainDetected = false;
+    rainNotificationSent = false;
+    Serial.println("\n--- Rain cleared ---");
+  }
+
+  // Handle actuator movement state updates
+  if (isActuatorMoving) {
+    unsigned long elapsed = now - actuatorMovementStart;
+    
+    if (elapsed >= ACTUATOR_MOVEMENT_TIME) {
+      // Movement complete
+      isActuatorMoving = false;
+      actuatorSafeTurnOff();
+      
+      // Update state to final position
+      if (targetMovement == "extend") {
+        updateActuatorState("extended");
+        isActuatorExtended = true;
+        Serial.println("Actuator fully extended!");
+      } else if (targetMovement == "retract") {
+        updateActuatorState("retracted");
+        isActuatorExtended = false;
+        Serial.println("Actuator fully retracted!");
+        
+        // Send notification ONLY if retraction was triggered by rain
+        if (rainDetected && !rainNotificationSent) {
+          sendNotification(
+            "Drying Rack Retracted",
+            "Rain detected. Drying rack fully retracted to protect your clothes.",
+            "system",
+            "actuator",
+            "rain_sensor",
+            "retract_complete",
+            "high",
+            lastTemp, lastHum, lastRainAO, lastLightAO
+          );
+          rainNotificationSent = true;
+        }
+      }
+      
+      targetMovement = "";
+      
+      // Start cooldown after movement completes
+      startActuatorCooldown();
+    } else {
+      // Still moving - print progress every 10 seconds
+      if (elapsed % 10000 < 100) {
+        Serial.print("Actuator moving... ");
+        Serial.print(elapsed / 1000);
+        Serial.print("/");
+        Serial.print(ACTUATOR_MOVEMENT_TIME / 1000);
+        Serial.println(" seconds");
+      }
+    }
+  }
+
+  // Regular sensor update interval
   if (now - lastUpdate >= interval) {
     lastUpdate = now;
-
-    // Read all sensors
-    float temp = readTemperature();
-    float hum = readHumidity();
-    int rainAO = readRainAO();
-    int lightAO = readLightAO();
 
     // Debug print
     Serial.println("\n=== Sensor Readings ===");
@@ -196,7 +363,9 @@ void loop() {
     Serial.print(hum);
     Serial.println(" %");
     Serial.print("Rain Sensor (AO): ");
-    Serial.println(rainAO);
+    Serial.print(rainAO);
+    Serial.print(" - ");
+    Serial.println(currentRainStatus ? "RAINING" : "DRY");
     Serial.print("Light Sensor (AO): ");
     Serial.println(lightAO);
     Serial.println("=======================");
@@ -204,10 +373,18 @@ void loop() {
     // Send to Firestore
     sendToFirestore(temp, hum, rainAO, lightAO);
   }
+
+  delay(100); // Small delay to prevent overwhelming the loop
 }
 
 // ===== Actuator Control Functions =====
 void extendActuator() {
+  // Check if already moving
+  if (isActuatorMoving) {
+    Serial.println("Actuator is currently moving. Please wait.");
+    return;
+  }
+
   // Check if cooldown is still active
   if (!isCooldownDone()) {
     unsigned long remainingTime = ACTUATOR_COOLDOWN_MS - (millis() - actuatorCooldownStart);
@@ -222,18 +399,35 @@ void extendActuator() {
     return;
   }
 
+  // Close fans first
+  if (isFansOpen) {
+    closeFans();
+  }
+
   actuatorSafeTurnOff();
 
-  // Both relays controlled: Relay1 HIGH (red=12V+), Relay2 LOW (black=GND)
+  // Update Firestore state to "moving_extend" FIRST
+  updateActuatorState("moving_extend");
+
+  // Start physical movement
   digitalWrite(actuatorExtendPin, HIGH);   // Relay1: COM→NO (12V+)
   digitalWrite(actuatorRetractPin, LOW);   // Relay2: COM→NC (GND)
 
-  isActuatorExtended = true;
-  Serial.println("Actuator extending...");
-  startActuatorCooldown();
+  // Set movement tracking
+  isActuatorMoving = true;
+  targetMovement = "extend";
+  actuatorMovementStart = millis();
+
+  Serial.println("Actuator extending... (60 seconds)");
 }
 
 void retractActuator() {
+  // Check if already moving
+  if (isActuatorMoving) {
+    Serial.println("Actuator is currently moving. Please wait.");
+    return;
+  }
+
   // Check if cooldown is still active
   if (!isCooldownDone()) {
     unsigned long remainingTime = ACTUATOR_COOLDOWN_MS - (millis() - actuatorCooldownStart);
@@ -243,26 +437,32 @@ void retractActuator() {
     return;
   }
 
-  if (!isActuatorExtended) {
+  if (!isActuatorExtended && !isActuatorMoving) {
     Serial.println("Actuator is already retracted");
     return;
   }
 
   actuatorSafeTurnOff();
 
-  // Reverse polarity: Relay1 LOW (red=GND), Relay2 HIGH (black=12V+)
+  // Update Firestore state to "moving_retract" FIRST
+  updateActuatorState("moving_retract");
+
+  // Start physical movement
   digitalWrite(actuatorExtendPin, LOW);    // Relay1: COM→NC (GND)
   digitalWrite(actuatorRetractPin, HIGH);  // Relay2: COM→NO (12V+)
 
-  isActuatorExtended = false;
-  Serial.println("Actuator retracting...");
-  startActuatorCooldown();
+  // Set movement tracking
+  isActuatorMoving = true;
+  targetMovement = "retract";
+  actuatorMovementStart = millis();
+
+  Serial.println("Actuator retracting... (60 seconds)");
 }
 
 void actuatorSafeTurnOff() {
   digitalWrite(actuatorExtendPin, LOW);
   digitalWrite(actuatorRetractPin, LOW);
-  delay(500); // Short delay for safety - unavoidable but minimal
+  delay(500); // Short delay for safety
   Serial.println("Actuator safe turn-off activated");
 }
 
@@ -292,8 +492,8 @@ void openFans() {
     return;
   }
 
-  if (isActuatorExtended) {
-    Serial.println("Fans can't be activated while actuator is extended");
+  if (isActuatorExtended || isActuatorMoving) {
+    Serial.println("Fans can't be activated while actuator is extended or moving");
     return;
   }
 
@@ -327,13 +527,11 @@ void sendNotification(const char* title, const char* body, const char* type,
 
   HTTPClient http;
 
-  // POST to notifications collection (auto-generates document ID)
   String url = "https://firestore.googleapis.com/v1/projects/smart-drying-iot/databases/(default)/documents/notifications";
 
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
 
-  // Get current UTC time for timestamps
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to get NTP time for notification");
@@ -344,7 +542,6 @@ void sendNotification(const char* title, const char* body, const char* type,
   char timestamp[30];
   strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
 
-  // Build JSON payload
   StaticJsonDocument<1024> doc;
   JsonObject fields = doc.createNestedObject("fields");
 
@@ -359,7 +556,7 @@ void sendNotification(const char* title, const char* body, const char* type,
   fields["category"]["stringValue"] = category;
 
   // Source Context
-  fields["deviceId"]["stringValue"] = "00:1A:2B:3C:4D:5E";
+  fields["deviceId"]["stringValue"] = DEVICE_ID;
   fields["trigger"]["stringValue"] = trigger;
 
   // Action/State Data
@@ -384,7 +581,6 @@ void sendNotification(const char* title, const char* body, const char* type,
   Serial.println("URL: " + url);
   Serial.println("Payload: " + payload);
 
-  // Use POST to create new document
   int httpCode = http.POST(payload);
 
   Serial.print("HTTP Response Code: ");
