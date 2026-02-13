@@ -191,7 +191,7 @@ void loop() {
     if (isnan(t)) t = 0;
     if (isnan(h)) h = 0;
 
-    Serial.printf("[SENSORS] T:%.1f H:%.1f Rain:%d\n", t, h, rain);
+    Serial.printf("[SENSORS] T:%.1f H:%.1f Rain:%d Light:%d\n", t, h, rain, light);
 
     FirebaseJson json;
     json.set("temperature", t);
@@ -205,6 +205,10 @@ void loop() {
     }
   }
 
+  // ============================================================
+  // RAIN SENSOR LOGIC - COMMENTED OUT UNTIL HARDWARE IS CONNECTED
+  // ============================================================
+  /*
   int rainVal = analogRead(RAIN_AO);
   bool rainDig = digitalRead(RAIN_DO) == LOW;
   
@@ -227,6 +231,10 @@ void loop() {
   } else {
     currentRainState = RAIN_NONE;
   }
+  */
+  // ============================================================
+  // UNCOMMENT THE ABOVE BLOCK WHEN RAIN SENSOR IS CONNECTED
+  // ============================================================
   
   delay(10);
 }
