@@ -36,7 +36,7 @@ const String FAN_PATH          = "/devices/" + DEVICE_ID + "/fans";
 #define BLE_STATUS_CHAR_UUID  "12345678-1234-1234-1234-123456789abd"
 #define BLE_COMMAND_CHAR_UUID "12345678-1234-1234-1234-123456789abe"
 
-BLEServer*         pServer            = nullptr;
+BLEServer* pServer            = nullptr;
 BLECharacteristic* pStatusChar        = nullptr;
 BLECharacteristic* pCommandChar       = nullptr;
 bool               bleClientConnected = false;
@@ -60,7 +60,7 @@ const int L_EN = 14;
 #define FAN1_PIN  32
 #define FAN2_PIN   4
 
-#define FAN_LEDC_FREQ       25000
+#define FAN_LEDC_FREQ       25
 #define FAN_LEDC_RESOLUTION 8
 
 #define RAIN_LIGHT_THRESHOLD  2000
@@ -92,37 +92,26 @@ RainState currentRainState = RAIN_NONE;
 String currentFanState = "off";
 String currentFanSpeed = "low";
 
+// --- NEW AUTONOMOUS TIMER VARIABLES ---
+bool _fanTimerActive = false;
+unsigned long _fanTimerStartedAt = 0;
+unsigned long _fanTimerDurationMs = 0;
+
 bool _fanStreamBootSkipDone = false;
 
 // ============================================================
 // CONCURRENCY — Operation Lock + Last-Write-Wins
 // ============================================================
-// Problem: Two stream events (actuator + fan) can arrive within
-// milliseconds of each other. Both guards check currentFanState /
-// currentPhysicalState, but these are only updated AFTER the
-// physical action completes — so both guards can pass before
-// either action runs. This is a TOCTOU race condition.
-//
-// Solution:
-//   1. acquireOperationLock() — only one command evaluates at a time.
-//      Lock is held for 200ms max (auto-released as safety net).
-//   2. clientTimestamp — Flutter sends a ms timestamp with every
-//      command. ESP32 compares timestamps: the NEWER command wins
-//      if two commands race. Older command is rejected.
-//   3. If two commands arrive with timestamps within 50ms of each
-//      other (true simultaneous tap), actuator safety takes priority:
-//      extend is blocked if fan-on arrived even slightly earlier.
-// ============================================================
 volatile bool _operationLock = false;
 unsigned long _operationLockAcquiredAt = 0;
-const unsigned long OPERATION_LOCK_TIMEOUT_MS = 200; // 200ms lock window
+
+const unsigned long OPERATION_LOCK_TIMEOUT_MS = 1000; 
 
 unsigned long _lastActuatorCmdTs = 0;
 unsigned long _lastFanCmdTs      = 0;
 
 bool acquireOperationLock() {
   unsigned long now = millis();
-  // Auto-release stale lock
   if (_operationLock && (now - _operationLockAcquiredAt) > OPERATION_LOCK_TIMEOUT_MS) {
     _operationLock = false;
     Serial.println("[LOCK] Stale lock auto-released");
@@ -183,10 +172,9 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
     value.trim();
     Serial.printf("[BLE CMD] Received: %s\n", value.c_str());
 
-    // ── Acquire lock — reject if another command is mid-evaluation ──
     if (!acquireOperationLock()) {
       Serial.println("[BLE LOCK] Command rejected — operation in progress");
-      sendBLEStatus(); // Send current state back so app can revert UI
+      sendBLEStatus(); 
       return;
     }
 
@@ -209,13 +197,26 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
     else if (value.startsWith("fan:")) {
       int firstColon  = value.indexOf(':');
       int secondColon = value.indexOf(':', firstColon + 1);
+      int thirdColon  = value.indexOf(':', secondColon + 1);
 
-      String fanTarget = (secondColon > 0)
-          ? value.substring(firstColon + 1, secondColon)
-          : value.substring(firstColon + 1);
-      String fanSpeedCmd = (secondColon > 0)
-          ? value.substring(secondColon + 1)
-          : currentFanSpeed;
+      String fanTarget = "";
+      String fanSpeedCmd = currentFanSpeed;
+      int durationMins = 0;
+
+      if (secondColon > 0) {
+          fanTarget = value.substring(firstColon + 1, secondColon);
+          if (thirdColon > 0) {
+              fanSpeedCmd = value.substring(secondColon + 1, thirdColon);
+              durationMins = value.substring(thirdColon + 1).toInt();
+              
+              if (durationMins > 120) durationMins = 120; // Max 2 hours
+              if (durationMins < 0) durationMins = 0;
+          } else {
+              fanSpeedCmd = value.substring(secondColon + 1);
+          }
+      } else {
+          fanTarget = value.substring(firstColon + 1);
+      }
 
       if (fanTarget == "on") {
         if (currentPhysicalState == "extended") {
@@ -225,11 +226,21 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
           currentFanSpeed = fanSpeedCmd;
           currentFanState = "on";
           applyFanSpeed(currentFanSpeed);
-          Serial.printf("[BLE FAN] ON at speed: %s\n", currentFanSpeed.c_str());
+
+          if (durationMins > 0) {
+              _fanTimerActive = true;
+              _fanTimerStartedAt = millis();
+              _fanTimerDurationMs = durationMins * 60000UL;
+              Serial.printf("[BLE FAN] ON speed: %s, timer: %d mins\n", currentFanSpeed.c_str(), durationMins);
+          } else {
+              _fanTimerActive = false;
+              Serial.printf("[BLE FAN] ON speed: %s, continuous\n", currentFanSpeed.c_str());
+          }
           sendBLEStatus();
         }
       } else if (fanTarget == "off") {
         currentFanState = "off";
+        _fanTimerActive = false; 
         stopBothFans();
         Serial.println("[BLE FAN] OFF");
         sendBLEStatus();
@@ -256,10 +267,18 @@ void sendBLEStatus() {
   if (isnan(t)) t = lastTemp;
   if (isnan(h)) h = lastHumidity;
 
+  long remaining = 0;
+  if (_fanTimerActive) {
+      long elapsed = millis() - _fanTimerStartedAt;
+      remaining = (_fanTimerDurationMs - elapsed) / 1000;
+      if (remaining < 0) remaining = 0;
+  }
+
   String status = "{";
   status += "\"actuator\":\"" + currentPhysicalState + "\",";
   status += "\"fan\":\"" + currentFanState + "\",";
   status += "\"fanSpeed\":\"" + currentFanSpeed + "\",";
+  status += "\"timerRemaining\":" + String(remaining) + ",";
   status += "\"rain\":" + String(rain) + ",";
   status += "\"temp\":" + String(t, 1) + ",";
   status += "\"humidity\":" + String(h, 1) + ",";
@@ -318,13 +337,10 @@ void startBLEMode() {
 void createNotification(String title, String body, String type, String category, String trigger, String action, String priority) {
   if (!Firebase.ready()) return;
 
-  String notifId   = "notif_" + String(millis());
-  String notifPath = NOTIFICATION_PATH + "/" + notifId;
-
   FirebaseJson notifJson;
   notifJson.set("title",    title);
   notifJson.set("body",     body);
-  notifJson.set("time",     (int)millis());
+  notifJson.set("time/.sv", "timestamp"); 
   notifJson.set("isRead",   false);
   notifJson.set("type",     type);
   notifJson.set("category", category);
@@ -341,9 +357,10 @@ void createNotification(String title, String body, String type, String category,
 
   notifJson.set("priority",     priority);
   notifJson.set("acknowledged", false);
-  notifJson.set("createdAt",    (int)millis());
+  notifJson.set("createdAt/.sv", "timestamp"); 
 
-  Firebase.RTDB.setJSONAsync(&fbdo, notifPath.c_str(), &notifJson);
+  Firebase.RTDB.pushJSONAsync(&fbdo, NOTIFICATION_PATH.c_str(), &notifJson);
+  
   Serial.printf("[NOTIFICATION] %s - %s\n", title.c_str(), body.c_str());
 }
 
@@ -368,18 +385,14 @@ void streamCallback(FirebaseStream data) {
   targetState.trim();
   if (targetState.length() == 0) return;
 
-  // ── Last-write-wins: ignore stale commands ────────────────
-  // If a newer actuator command already arrived, skip this one.
-  if (clientTs > 0 && clientTs < _lastActuatorCmdTs) {
-    Serial.printf("[LWW] Actuator command ts=%lu < last=%lu — discarded\n", clientTs, _lastActuatorCmdTs);
+  if (clientTs > 0 && clientTs <= _lastActuatorCmdTs) {
+    Serial.printf("[LWW] Actuator command ts=%lu <= last=%lu — discarded\n", clientTs, _lastActuatorCmdTs);
     return;
   }
   if (clientTs > 0) _lastActuatorCmdTs = clientTs;
 
-  // ── Acquire operation lock ────────────────────────────────
   if (!acquireOperationLock()) {
     Serial.println("[LOCK] Actuator command queued — lock held by fan");
-    // Re-check after brief delay (fan command is evaluating)
     delay(OPERATION_LOCK_TIMEOUT_MS + 10);
     if (!acquireOperationLock()) {
       Serial.println("[LOCK] Actuator command dropped after retry");
@@ -390,7 +403,6 @@ void streamCallback(FirebaseStream data) {
 
   Serial.printf("[STREAM] Actuator target: %s (ts=%lu)\n", targetState.c_str(), clientTs);
 
-  // ── Safety guards ─────────────────────────────────────────
   if (targetState == "extended" && currentRainState == RAIN_HEAVY) {
     releaseOperationLock();
     rejectCommandAndRevert("heavy_rain_detected", clientTs);
@@ -405,7 +417,6 @@ void streamCallback(FirebaseStream data) {
     return;
   }
 
-  // ── Execute ───────────────────────────────────────────────
   if      (targetState == "extended"  && currentPhysicalState != "extended")  extendActuatorInternal("app_command");
   else if (targetState == "retracted" && currentPhysicalState != "retracted") retractActuatorInternal("app_command");
 
@@ -429,6 +440,8 @@ void fanStreamCallback(FirebaseStream data) {
   Serial.println("[FAN STREAM] Data received");
   String target    = "";
   String speed     = "";
+  int durationMins = 0;
+  bool hasDuration = false;
   unsigned long clientTs = 0;
 
   if (data.dataType() == "json") {
@@ -436,22 +449,26 @@ void fanStreamCallback(FirebaseStream data) {
     FirebaseJsonData result;
     if (json.get(result, "target"))          { target = result.stringValue; target.replace("\"",""); target.trim(); }
     if (json.get(result, "speed"))           { speed  = result.stringValue; speed.replace("\"","");  speed.trim();  }
+    if (json.get(result, "duration"))        { durationMins = result.intValue; hasDuration = true; }
     if (json.get(result, "clientTimestamp")) clientTs = (unsigned long)result.intValue;
   } else if (data.dataType() == "string") {
     if      (data.dataPath() == "/target") { target = data.stringData(); target.replace("\"",""); target.trim(); speed = currentFanSpeed; }
     else if (data.dataPath() == "/speed")  { speed  = data.stringData(); speed.replace("\"","");  speed.trim();  target = currentFanState; }
+  } else if (data.dataType() == "int" || data.dataType() == "double") {
+    if (data.dataPath() == "/duration") { durationMins = data.intData(); hasDuration = true; target = currentFanState; speed = currentFanSpeed; }
   }
 
   if (speed != "low" && speed != "mid" && speed != "high") speed = currentFanSpeed;
 
-  // ── Last-write-wins ───────────────────────────────────────
-  if (clientTs > 0 && clientTs < _lastFanCmdTs) {
-    Serial.printf("[LWW] Fan command ts=%lu < last=%lu — discarded\n", clientTs, _lastFanCmdTs);
+  if (durationMins > 120) durationMins = 120; // Max 2 hours
+  if (durationMins < 0) durationMins = 0;
+
+  if (clientTs > 0 && clientTs <= _lastFanCmdTs) {
+    Serial.printf("[LWW] Fan command ts=%lu <= last=%lu — discarded duplicate\n", clientTs, _lastFanCmdTs);
     return;
   }
   if (clientTs > 0) _lastFanCmdTs = clientTs;
 
-  // ── Acquire operation lock ────────────────────────────────
   if (!acquireOperationLock()) {
     Serial.println("[LOCK] Fan command queued — lock held by actuator");
     delay(OPERATION_LOCK_TIMEOUT_MS + 10);
@@ -465,20 +482,34 @@ void fanStreamCallback(FirebaseStream data) {
   Serial.printf("[FAN STREAM] target=%s speed=%s (ts=%lu)\n", target.c_str(), speed.c_str(), clientTs);
 
   if (target == "on") {
-    // ── Safety guard ─────────────────────────────────────────
     if (currentPhysicalState == "extended") {
       releaseOperationLock();
       rejectFanCommandAndRevert("actuator_is_extended", clientTs);
       createNotification("Command Blocked", "Retract the actuator before turning on the drying fans.", "warning", "system", "user_command_rejected", "command_blocked", "high");
       return;
     }
+    
     currentFanSpeed = speed;
     currentFanState = "on";
     applyFanSpeed(currentFanSpeed);
+
+    if (hasDuration) {
+        if (durationMins > 0) {
+            _fanTimerActive = true;
+            _fanTimerStartedAt = millis();
+            _fanTimerDurationMs = durationMins * 60000UL;
+            Serial.printf("[FAN] Timer set for %d mins\n", durationMins);
+        } else {
+            _fanTimerActive = false;
+            Serial.println("[FAN] Continuous mode (timer cleared)");
+        }
+    }
+    
     updateFanCloudState("on", currentFanSpeed);
   }
   else if (target == "off") {
     currentFanState = "off";
+    _fanTimerActive = false; 
     stopBothFans();
     updateFanCloudState("off", currentFanSpeed);
   }
@@ -494,14 +525,29 @@ void fanStreamTimeoutCallback(bool timeout) {
 // FAN HELPERS
 // ============================================================
 void applyFanSpeed(String speed) {
-  uint8_t duty = 80;
-  if      (speed == "low")  duty = 80;
-  else if (speed == "mid")  duty = 160;
+  uint8_t duty = 100;
+  if      (speed == "low")  duty = 100;
+  else if (speed == "mid")  duty = 180;
   else if (speed == "high") duty = 255;
 
+  Serial.printf("[FAN PWM] Target speed=%s duty=%d\n", speed.c_str(), duty);
+
+  // --- THE KICKSTART FIX ---
+  // 1. Cut power briefly to reset the fan's internal capacitor/chip
+  ledcWrite(FAN1_PIN, 0);
+  ledcWrite(FAN2_PIN, 0);
+  delay(50); 
+
+  // 2. If turning ON (not target 0), give a 100% blast to jumpstart the motor 
+  if (duty > 0 && duty < 255) {
+    ledcWrite(FAN1_PIN, 255);
+    ledcWrite(FAN2_PIN, 255);
+    delay(150); // Spin up burst for 150ms
+  }
+
+  // 3. Drop down gracefully to the target duty cycle
   ledcWrite(FAN1_PIN, duty);
   ledcWrite(FAN2_PIN, duty);
-  Serial.printf("[FAN PWM] speed=%s duty=%d\n", speed.c_str(), duty);
 }
 
 void stopBothFans() {
@@ -516,13 +562,11 @@ void updateFanCloudState(String state, String speed) {
   json.set("state", state);
   json.set("speed", speed);
   json.set("target", state);
-  json.set("lastCommandAt", (int)millis());
+  if (state == "off") json.set("duration", 0); 
+  json.set("lastCommandAt/.sv", "timestamp");
   Firebase.RTDB.updateNodeAsync(&fbdo, FAN_PATH.c_str(), &json);
 }
 
-// ── rejectFanCommandAndRevert — echoes clientTimestamp back ──
-// Flutter uses the echoed timestamp to decide if this rejection
-// belongs to its last command (last-write-wins check on app side).
 void rejectFanCommandAndRevert(const char* reason, unsigned long clientTs) {
   if (!Firebase.ready()) return;
   FirebaseJson json;
@@ -530,8 +574,8 @@ void rejectFanCommandAndRevert(const char* reason, unsigned long clientTs) {
   json.set("state",           "off");
   json.set("commandRejected", true);
   json.set("rejectionReason", reason);
-  json.set("clientTimestamp", (int)clientTs);  // ← echo back for Flutter LWW check
-  json.set("lastCommandAt",   (int)millis());
+  json.set("clientTimestamp", (int)clientTs);
+  json.set("lastCommandAt/.sv", "timestamp");
   Firebase.RTDB.updateNodeAsync(&fbdo, FAN_PATH.c_str(), &json);
   Serial.printf("[SAFETY] Fan rejected: %s (ts=%lu)\n", reason, clientTs);
 }
@@ -542,7 +586,8 @@ void initFanNodeOnBoot() {
   json.set("state", "off");
   json.set("speed", "low");
   json.set("target", "off");
-  json.set("lastCommandAt", (int)millis());
+  json.set("duration", 0);
+  json.set("lastCommandAt/.sv", "timestamp");
   Firebase.RTDB.updateNodeAsync(&fbdo, FAN_PATH.c_str(), &json);
   Serial.println("[BOOT] fans/ node initialized");
 }
@@ -633,6 +678,21 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // --- AUTONOMOUS FAN TIMER CHECK ---
+  if (_fanTimerActive && (now - _fanTimerStartedAt >= _fanTimerDurationMs)) {
+      _fanTimerActive = false;
+      currentFanState = "off";
+      stopBothFans();
+      Serial.println("[TIMER] Fan timer expired! Fans OFF.");
+
+      if (!bleMode) {
+          updateFanCloudState("off", currentFanSpeed);
+      }
+      if (bleClientConnected) {
+          sendBLEStatus();
+      }
+  }
+
   // ── BLE MODE ──────────────────────────────────────────────
   if (bleMode) {
     if (now - lastSensorUpdate >= SENSOR_INTERVAL) {
@@ -686,7 +746,7 @@ void loop() {
     FirebaseJson json;
     json.set("temperature", t); json.set("humidity", h);
     json.set("rainAO", rain);   json.set("light", light);
-    json.set("updatedAt", (int)now);
+    json.set("updatedAt/.sv", "timestamp");
     if (Firebase.ready()) Firebase.RTDB.updateNodeAsync(&fbdo, SENSOR_PATH.c_str(), &json);
   }
 
@@ -728,11 +788,11 @@ void updateCloudState(String state, String source) {
   if (!Firebase.ready()) return;
   FirebaseJson json;
   json.set("state", state); json.set("source", source);
-  json.set("target", state); json.set("lastCommandAt", (int)millis());
+  json.set("target", state); 
+  json.set("lastCommandAt/.sv", "timestamp");
   Firebase.RTDB.updateNodeAsync(&fbdo, ACTUATOR_PATH.c_str(), &json);
 }
 
-// ── rejectCommandAndRevert — echoes clientTimestamp back ─────
 void rejectCommandAndRevert(const char* reason, unsigned long clientTs) {
   if (!Firebase.ready()) return;
   FirebaseJson json;
@@ -740,8 +800,8 @@ void rejectCommandAndRevert(const char* reason, unsigned long clientTs) {
   json.set("state",           currentPhysicalState);
   json.set("commandRejected", true);
   json.set("rejectionReason", reason);
-  json.set("clientTimestamp", (int)clientTs);  // ← echo back for Flutter LWW check
-  json.set("lastCommandAt",   (int)millis());
+  json.set("clientTimestamp", (int)clientTs);  
+  json.set("lastCommandAt/.sv", "timestamp");
   Firebase.RTDB.updateNodeAsync(&fbdo, ACTUATOR_PATH.c_str(), &json);
   Serial.printf("[SAFETY] Actuator rejected: %s (ts=%lu)\n", reason, clientTs);
 }
