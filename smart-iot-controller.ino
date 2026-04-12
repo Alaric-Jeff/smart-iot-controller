@@ -54,14 +54,9 @@ bool               bleMode            = false;
 
 const int RPWM = 25;
 const int LPWM = 26;
-const int R_EN = 27;
-const int L_EN = 14;
+// R_EN and L_EN pins removed - Hardwired to 5V Rail
 
-#define FAN1_PIN  32
-#define FAN2_PIN   4
-
-#define FAN_LEDC_FREQ       25
-#define FAN_LEDC_RESOLUTION 8
+#define FAN_PIN   32
 
 #define RAIN_LIGHT_THRESHOLD  2000
 #define RAIN_HEAVY_THRESHOLD  800
@@ -90,7 +85,6 @@ enum RainState { RAIN_NONE, RAIN_LIGHT, RAIN_HEAVY };
 RainState currentRainState = RAIN_NONE;
 
 String currentFanState = "off";
-String currentFanSpeed = "low";
 
 // --- NEW AUTONOMOUS TIMER VARIABLES ---
 bool _fanTimerActive = false;
@@ -140,9 +134,9 @@ void rejectFanCommandAndRevert(const char* reason, unsigned long clientTs);
 void createNotification(String title, String body, String type, String category, String trigger, String action, String priority);
 void fanStreamCallback(FirebaseStream data);
 void fanStreamTimeoutCallback(bool timeout);
-void applyFanSpeed(String speed);
-void stopBothFans();
-void updateFanCloudState(String state, String speed);
+void startFan();
+void stopFan();
+void updateFanCloudState(String state);
 void initFanNodeOnBoot();
 void startBLEMode();
 void sendBLEStatus();
@@ -183,7 +177,7 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
         Serial.println("[BLE SAFETY] Extend blocked: heavy rain");
         sendBLEStatus();
       } else if (currentFanState == "on") {
-        Serial.println("[BLE SAFETY] Extend blocked: fans are on");
+        Serial.println("[BLE SAFETY] Extend blocked: fan is on");
         sendBLEStatus();
       } else {
         extendActuatorInternal("ble_command");
@@ -197,23 +191,16 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
     else if (value.startsWith("fan:")) {
       int firstColon  = value.indexOf(':');
       int secondColon = value.indexOf(':', firstColon + 1);
-      int thirdColon  = value.indexOf(':', secondColon + 1);
 
       String fanTarget = "";
-      String fanSpeedCmd = currentFanSpeed;
       int durationMins = 0;
 
       if (secondColon > 0) {
           fanTarget = value.substring(firstColon + 1, secondColon);
-          if (thirdColon > 0) {
-              fanSpeedCmd = value.substring(secondColon + 1, thirdColon);
-              durationMins = value.substring(thirdColon + 1).toInt();
-              
-              if (durationMins > 120) durationMins = 120; // Max 2 hours
-              if (durationMins < 0) durationMins = 0;
-          } else {
-              fanSpeedCmd = value.substring(secondColon + 1);
-          }
+          durationMins = value.substring(secondColon + 1).toInt();
+          
+          if (durationMins > 120) durationMins = 120; // Max 2 hours
+          if (durationMins < 0) durationMins = 0;
       } else {
           fanTarget = value.substring(firstColon + 1);
       }
@@ -223,25 +210,24 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
           Serial.println("[BLE SAFETY] Fan blocked: actuator extended");
           sendBLEStatus();
         } else {
-          currentFanSpeed = fanSpeedCmd;
           currentFanState = "on";
-          applyFanSpeed(currentFanSpeed);
+          startFan();
 
           if (durationMins > 0) {
               _fanTimerActive = true;
               _fanTimerStartedAt = millis();
               _fanTimerDurationMs = durationMins * 60000UL;
-              Serial.printf("[BLE FAN] ON speed: %s, timer: %d mins\n", currentFanSpeed.c_str(), durationMins);
+              Serial.printf("[BLE FAN] ON timer: %d mins\n", durationMins);
           } else {
               _fanTimerActive = false;
-              Serial.printf("[BLE FAN] ON speed: %s, continuous\n", currentFanSpeed.c_str());
+              Serial.println("[BLE FAN] ON continuous\n");
           }
           sendBLEStatus();
         }
       } else if (fanTarget == "off") {
         currentFanState = "off";
         _fanTimerActive = false; 
-        stopBothFans();
+        stopFan();
         Serial.println("[BLE FAN] OFF");
         sendBLEStatus();
       }
@@ -277,7 +263,6 @@ void sendBLEStatus() {
   String status = "{";
   status += "\"actuator\":\"" + currentPhysicalState + "\",";
   status += "\"fan\":\"" + currentFanState + "\",";
-  status += "\"fanSpeed\":\"" + currentFanSpeed + "\",";
   status += "\"timerRemaining\":" + String(remaining) + ",";
   status += "\"rain\":" + String(rain) + ",";
   status += "\"temp\":" + String(t, 1) + ",";
@@ -412,8 +397,8 @@ void streamCallback(FirebaseStream data) {
 
   if (targetState == "extended" && currentFanState == "on") {
     releaseOperationLock();
-    rejectCommandAndRevert("fans_are_on", clientTs);
-    createNotification("Command Blocked", "Turn off the drying fans before extending the actuator.", "warning", "system", "user_command_rejected", "command_blocked", "high");
+    rejectCommandAndRevert("fan_is_on", clientTs);
+    createNotification("Command Blocked", "Turn off the drying fan before extending the actuator.", "warning", "system", "user_command_rejected", "command_blocked", "high");
     return;
   }
 
@@ -439,7 +424,6 @@ void fanStreamCallback(FirebaseStream data) {
 
   Serial.println("[FAN STREAM] Data received");
   String target    = "";
-  String speed     = "";
   int durationMins = 0;
   bool hasDuration = false;
   unsigned long clientTs = 0;
@@ -448,17 +432,13 @@ void fanStreamCallback(FirebaseStream data) {
     FirebaseJson &json = data.jsonObject();
     FirebaseJsonData result;
     if (json.get(result, "target"))          { target = result.stringValue; target.replace("\"",""); target.trim(); }
-    if (json.get(result, "speed"))           { speed  = result.stringValue; speed.replace("\"","");  speed.trim();  }
     if (json.get(result, "duration"))        { durationMins = result.intValue; hasDuration = true; }
     if (json.get(result, "clientTimestamp")) clientTs = (unsigned long)result.intValue;
   } else if (data.dataType() == "string") {
-    if      (data.dataPath() == "/target") { target = data.stringData(); target.replace("\"",""); target.trim(); speed = currentFanSpeed; }
-    else if (data.dataPath() == "/speed")  { speed  = data.stringData(); speed.replace("\"","");  speed.trim();  target = currentFanState; }
+    if (data.dataPath() == "/target") { target = data.stringData(); target.replace("\"",""); target.trim(); }
   } else if (data.dataType() == "int" || data.dataType() == "double") {
-    if (data.dataPath() == "/duration") { durationMins = data.intData(); hasDuration = true; target = currentFanState; speed = currentFanSpeed; }
+    if (data.dataPath() == "/duration") { durationMins = data.intData(); hasDuration = true; target = currentFanState; }
   }
-
-  if (speed != "low" && speed != "mid" && speed != "high") speed = currentFanSpeed;
 
   if (durationMins > 120) durationMins = 120; // Max 2 hours
   if (durationMins < 0) durationMins = 0;
@@ -479,19 +459,18 @@ void fanStreamCallback(FirebaseStream data) {
     }
   }
 
-  Serial.printf("[FAN STREAM] target=%s speed=%s (ts=%lu)\n", target.c_str(), speed.c_str(), clientTs);
+  Serial.printf("[FAN STREAM] target=%s (ts=%lu)\n", target.c_str(), clientTs);
 
   if (target == "on") {
     if (currentPhysicalState == "extended") {
       releaseOperationLock();
       rejectFanCommandAndRevert("actuator_is_extended", clientTs);
-      createNotification("Command Blocked", "Retract the actuator before turning on the drying fans.", "warning", "system", "user_command_rejected", "command_blocked", "high");
+      createNotification("Command Blocked", "Retract the actuator before turning on the drying fan.", "warning", "system", "user_command_rejected", "command_blocked", "high");
       return;
     }
     
-    currentFanSpeed = speed;
     currentFanState = "on";
-    applyFanSpeed(currentFanSpeed);
+    startFan();
 
     if (hasDuration) {
         if (durationMins > 0) {
@@ -505,13 +484,13 @@ void fanStreamCallback(FirebaseStream data) {
         }
     }
     
-    updateFanCloudState("on", currentFanSpeed);
+    updateFanCloudState("on");
   }
   else if (target == "off") {
     currentFanState = "off";
     _fanTimerActive = false; 
-    stopBothFans();
-    updateFanCloudState("off", currentFanSpeed);
+    stopFan();
+    updateFanCloudState("off");
   }
 
   releaseOperationLock();
@@ -524,43 +503,20 @@ void fanStreamTimeoutCallback(bool timeout) {
 // ============================================================
 // FAN HELPERS
 // ============================================================
-void applyFanSpeed(String speed) {
-  uint8_t duty = 100;
-  if      (speed == "low")  duty = 100;
-  else if (speed == "mid")  duty = 180;
-  else if (speed == "high") duty = 255;
-
-  Serial.printf("[FAN PWM] Target speed=%s duty=%d\n", speed.c_str(), duty);
-
-  // --- THE KICKSTART FIX ---
-  // 1. Cut power briefly to reset the fan's internal capacitor/chip
-  ledcWrite(FAN1_PIN, 0);
-  ledcWrite(FAN2_PIN, 0);
-  delay(50); 
-
-  // 2. If turning ON (not target 0), give a 100% blast to jumpstart the motor 
-  if (duty > 0 && duty < 255) {
-    ledcWrite(FAN1_PIN, 255);
-    ledcWrite(FAN2_PIN, 255);
-    delay(150); // Spin up burst for 150ms
-  }
-
-  // 3. Drop down gracefully to the target duty cycle
-  ledcWrite(FAN1_PIN, duty);
-  ledcWrite(FAN2_PIN, duty);
+void startFan() {
+  digitalWrite(FAN_PIN, HIGH);
+  Serial.println("[FAN] Fan ON");
 }
 
-void stopBothFans() {
-  ledcWrite(FAN1_PIN, 0);
-  ledcWrite(FAN2_PIN, 0);
-  Serial.println("[FAN PWM] Both fans stopped");
+void stopFan() {
+  digitalWrite(FAN_PIN, LOW);
+  Serial.println("[FAN] Fan OFF");
 }
 
-void updateFanCloudState(String state, String speed) {
+void updateFanCloudState(String state) {
   if (!Firebase.ready()) return;
   FirebaseJson json;
   json.set("state", state);
-  json.set("speed", speed);
   json.set("target", state);
   if (state == "off") json.set("duration", 0); 
   json.set("lastCommandAt/.sv", "timestamp");
@@ -584,7 +540,6 @@ void initFanNodeOnBoot() {
   if (!Firebase.ready()) return;
   FirebaseJson json;
   json.set("state", "off");
-  json.set("speed", "low");
   json.set("target", "off");
   json.set("duration", 0);
   json.set("lastCommandAt/.sv", "timestamp");
@@ -601,14 +556,11 @@ void setup() {
   delay(1000);
 
   pinMode(RPWM, OUTPUT); pinMode(LPWM, OUTPUT);
-  pinMode(R_EN, OUTPUT); pinMode(L_EN, OUTPUT);
-  digitalWrite(R_EN, HIGH); digitalWrite(L_EN, HIGH);
+  // Removed R_EN and L_EN configuration
   motorStop();
 
-  ledcAttach(FAN1_PIN, FAN_LEDC_FREQ, FAN_LEDC_RESOLUTION);
-  ledcWrite(FAN1_PIN, 0);
-  ledcAttach(FAN2_PIN, FAN_LEDC_FREQ, FAN_LEDC_RESOLUTION);
-  ledcWrite(FAN2_PIN, 0);
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);
 
   pinMode(RAIN_DO, INPUT);
   pinMode(LIGHT_DO, INPUT);
@@ -682,11 +634,11 @@ void loop() {
   if (_fanTimerActive && (now - _fanTimerStartedAt >= _fanTimerDurationMs)) {
       _fanTimerActive = false;
       currentFanState = "off";
-      stopBothFans();
-      Serial.println("[TIMER] Fan timer expired! Fans OFF.");
+      stopFan();
+      Serial.println("[TIMER] Fan timer expired! Fan OFF.");
 
       if (!bleMode) {
-          updateFanCloudState("off", currentFanSpeed);
+          updateFanCloudState("off");
       }
       if (bleClientConnected) {
           sendBLEStatus();
