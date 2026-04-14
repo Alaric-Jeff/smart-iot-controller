@@ -6,6 +6,7 @@
 #include "DHT.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include <time.h>
 
 // --- BLE ---
 #include <BLEDevice.h>
@@ -61,7 +62,7 @@ const int LPWM = 26;
 
 #define RAIN_LIGHT_THRESHOLD  2000
 #define RAIN_HEAVY_THRESHOLD  800
-#define RAIN_CLEAR_MIN        4080  // analogRead threshold for "no rain / clear"
+#define RAIN_CLEAR_MIN        4080
 
 // ============================================================
 // GLOBAL VARIABLES
@@ -85,37 +86,36 @@ int   lastRainVal  = 0;
 int   lastLightVal = 0;
 
 enum RainState { RAIN_NONE, RAIN_LIGHT, RAIN_HEAVY };
-RainState currentRainState     = RAIN_NONE;
-RainState previousRainState    = RAIN_NONE;
+RainState currentRainState  = RAIN_NONE;
+RainState previousRainState = RAIN_NONE;
 
 String currentFanState = "off";
 
 // ============================================================
 // AUTOMATION FLAGS
 // ============================================================
-bool _autoExtend = false;  // Read from RTDB settings/autoExtend
+bool _autoExtend = false;
 
 // --- AUTO-RETRACT POST-RAIN FAN TIMER (75s delay) ---
-bool _autoRetractFanPending       = false;
-unsigned long _autoRetractFanAt   = 0;
+bool _autoRetractFanPending     = false;
+unsigned long _autoRetractFanAt = 0;
 const unsigned long AUTO_FAN_DELAY_MS = 75000UL;
 
 // --- AUTO-EXTEND FAN-OFF WAIT (5s delay) ---
-bool _autoExtendPending           = false;
-unsigned long _autoExtendAt       = 0;
+bool _autoExtendPending     = false;
+unsigned long _autoExtendAt = 0;
 const unsigned long AUTO_EXTEND_FAN_OFF_WAIT_MS = 5000UL;
 
 // ============================================================
 // FAN TIMER VARIABLES
 // ============================================================
-bool _fanTimerActive = false;
+bool _fanTimerActive          = false;
 unsigned long _fanTimerStartedAt  = 0;
 unsigned long _fanTimerDurationMs = 0;
 
-// Auto fan duration matches lowest timer in controls.dart = 5 minutes
 const int AUTO_FAN_DURATION_MINS = 5;
 
-bool _fanStreamBootSkipDone     = false;
+bool _fanStreamBootSkipDone      = false;
 bool _settingsStreamBootSkipDone = false;
 
 // ============================================================
@@ -142,6 +142,15 @@ bool acquireOperationLock() {
 
 void releaseOperationLock() {
   _operationLock = false;
+}
+
+// ============================================================
+// EPOCH TIME HELPER
+// ============================================================
+long getEpochMs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (long)(tv.tv_sec) * 1000L + (tv.tv_usec / 1000);
 }
 
 // ============================================================
@@ -240,9 +249,9 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
           currentFanState = "on";
           startFan();
           if (durationMins > 0) {
-            _fanTimerActive      = true;
-            _fanTimerStartedAt   = millis();
-            _fanTimerDurationMs  = durationMins * 60000UL;
+            _fanTimerActive     = true;
+            _fanTimerStartedAt  = millis();
+            _fanTimerDurationMs = durationMins * 60000UL;
             Serial.printf("[BLE FAN] ON timer: %d mins\n", durationMins);
           } else {
             _fanTimerActive = false;
@@ -251,8 +260,8 @@ class SmartRackCommandCallbacks : public BLECharacteristicCallbacks {
           sendBLEStatus();
         }
       } else if (fanTarget == "off") {
-        currentFanState  = "off";
-        _fanTimerActive  = false;
+        currentFanState = "off";
+        _fanTimerActive = false;
         stopFan();
         Serial.println("[BLE FAN] OFF");
         sendBLEStatus();
@@ -375,7 +384,7 @@ void createNotification(String title, String body, String type, String category,
 }
 
 // ============================================================
-// SETTINGS STREAM CALLBACK — listens to autoExtend in real-time
+// SETTINGS STREAM CALLBACK
 // ============================================================
 void settingsStreamCallback(FirebaseStream data) {
   if (!_settingsStreamBootSkipDone) {
@@ -400,7 +409,6 @@ void settingsStreamCallback(FirebaseStream data) {
     _autoExtend = newAutoExtend;
     Serial.printf("[SETTINGS] autoExtend changed to: %s\n", _autoExtend ? "true" : "false");
 
-    // Cancel any pending auto-extend if feature was just disabled
     if (!_autoExtend && _autoExtendPending) {
       _autoExtendPending = false;
       Serial.println("[AUTO-EXTEND] Pending extension cancelled — feature disabled");
@@ -541,7 +549,7 @@ void fanStreamCallback(FirebaseStream data) {
       _fanTimerDurationMs = durationMins * 60000UL;
       Serial.printf("[FAN] Timer set for %d mins\n", durationMins);
 
-      long endsAtMs = (long)millis() + (long)_fanTimerDurationMs;
+      long endsAtMs = getEpochMs() + (long)_fanTimerDurationMs;
       updateFanCloudState("on", durationMins, endsAtMs);
     } else {
       if (hasDuration) _fanTimerActive = false;
@@ -618,11 +626,10 @@ void initFanNodeOnBoot() {
 
 // ============================================================
 // AUTO-RETRACT: turn fan on after 75s delay
-// Called once actuator has retracted due to rain
 // ============================================================
 void autoRetractFanOn() {
-  if (currentPhysicalState == "extended") return; // safety guard
-  if (currentFanState == "on") return;             // already on
+  if (currentPhysicalState == "extended") return;
+  if (currentFanState == "on") return;
 
   currentFanState     = "on";
   _fanTimerActive     = true;
@@ -631,7 +638,7 @@ void autoRetractFanOn() {
 
   startFan();
 
-  long endsAtMs = (long)(millis() + _fanTimerDurationMs);
+  long endsAtMs = getEpochMs() + (long)_fanTimerDurationMs;
   updateFanCloudState("on", AUTO_FAN_DURATION_MINS, endsAtMs);
 
   createNotification(
@@ -645,11 +652,10 @@ void autoRetractFanOn() {
 
 // ============================================================
 // AUTO-EXTEND: extend actuator when weather clears
-// Called on RAIN_NONE transition when autoExtend is enabled
 // ============================================================
 void autoExtendActuator() {
-  if (currentPhysicalState == "extended") return; // already extended
-  if (currentRainState != RAIN_NONE)       return; // safety guard
+  if (currentPhysicalState == "extended") return;
+  if (currentRainState != RAIN_NONE)       return;
 
   extendActuatorInternal("auto_extend");
 
@@ -702,6 +708,16 @@ void setup() {
   }
 
   Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
+
+  // ── NTP Time Sync ─────────────────────────────────────────
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("[NTP] Syncing time");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n[NTP] Time synced");
 
   config.api_key               = API_KEY;
   config.database_url          = DATABASE_URL;
@@ -776,7 +792,6 @@ void loop() {
   // ── AUTO-EXTEND PENDING (5s fan-off wait) ─────────────────
   if (_autoExtendPending && (now >= _autoExtendAt)) {
     _autoExtendPending = false;
-    // Re-check all conditions before extending
     if (_autoExtend &&
         currentRainState == RAIN_NONE &&
         currentPhysicalState == "retracted" &&
@@ -821,8 +836,7 @@ void loop() {
       currentRainState = RAIN_NONE;
     }
 
-    if (bleClientConnected &&
-        (currentRainState != previousRainState)) {
+    if (bleClientConnected && (currentRainState != previousRainState)) {
       sendBLEStatus();
     }
 
@@ -859,7 +873,6 @@ void loop() {
     if (currentRainState != RAIN_HEAVY) {
       currentRainState = RAIN_HEAVY;
 
-      // Always retract on rain (standard behaviour, no toggle)
       if (currentPhysicalState != "retracted") {
         retractActuatorInternal("rain_heavy");
         createNotification(
@@ -867,13 +880,11 @@ void loop() {
           "Actuator retracted due to heavy rainfall.",
           "alert", "weather", "rain_sensor", "actuator_retracted", "high"
         );
-        // Schedule fan auto-on after 75s
         _autoRetractFanPending = true;
         _autoRetractFanAt      = now + AUTO_FAN_DELAY_MS;
         Serial.println("[AUTO] Fan scheduled in 75s after retraction");
       }
 
-      // Cancel any pending auto-extend
       _autoExtendPending = false;
     }
   }
@@ -888,13 +899,11 @@ void loop() {
           "Actuator retracted due to light rain.",
           "info", "weather", "rain_sensor", "actuator_retracted", "medium"
         );
-        // Schedule fan auto-on after 75s
         _autoRetractFanPending = true;
         _autoRetractFanAt      = now + AUTO_FAN_DELAY_MS;
         Serial.println("[AUTO] Fan scheduled in 75s after retraction");
       }
 
-      // Cancel any pending auto-extend
       _autoExtendPending = false;
     }
   }
@@ -902,13 +911,11 @@ void loop() {
     // ── NO RAIN — RAIN_NONE ───────────────────────────────
     currentRainState = RAIN_NONE;
 
-    // State transition: rain cleared → trigger autoExtend check
     if (previousRainState != RAIN_NONE && _autoExtend) {
       Serial.println("[AUTO-EXTEND] Rain cleared — evaluating auto-extend");
 
       if (currentPhysicalState == "retracted") {
         if (currentFanState == "on") {
-          // Fan is on — turn it off, wait 5s, then extend
           currentFanState = "off";
           _fanTimerActive = false;
           stopFan();
@@ -918,9 +925,8 @@ void loop() {
           _autoExtendAt      = now + AUTO_EXTEND_FAN_OFF_WAIT_MS;
           Serial.println("[AUTO-EXTEND] Fan turned off — extending in 5s");
         } else {
-          // Fan already off — extend immediately
           _autoExtendPending = true;
-          _autoExtendAt      = now; // fire next loop
+          _autoExtendAt      = now;
           Serial.println("[AUTO-EXTEND] Fan already off — extending now");
         }
       }
