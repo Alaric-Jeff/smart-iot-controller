@@ -7,6 +7,8 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include <time.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 // --- BLE ---
 #include <BLEDevice.h>
@@ -22,6 +24,8 @@ const char* password = "pogiako123";
 
 #define API_KEY       "AIzaSyCkPtysjodxh356vyuQSaAhg59xjeHjMVU"
 #define DATABASE_URL  "https://smart-drying-iot-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+#define CLOUDFLARE_WORKER_URL "https://push-notification.saldc-cloudflare.workers.dev"
 
 const String DEVICE_ID         = "00:1A:2B:3C:4D:5E";
 const String ACTUATOR_PATH     = "/devices/" + DEVICE_ID + "/actuator";
@@ -56,7 +60,6 @@ bool bleMode                    = false;
 
 const int RPWM = 25;
 const int LPWM = 26;
-// R_EN and L_EN pins removed - Hardwired to 5V Rail
 
 #define FAN_PIN   32
 
@@ -96,12 +99,10 @@ String currentFanState = "off";
 // ============================================================
 bool _autoExtend = false;
 
-// --- AUTO-RETRACT POST-RAIN FAN TIMER (75s delay) ---
 bool _autoRetractFanPending     = false;
 unsigned long _autoRetractFanAt = 0;
 const unsigned long AUTO_FAN_DELAY_MS = 75000UL;
 
-// --- AUTO-EXTEND FAN-OFF WAIT (5s delay) ---
 bool _autoExtendPending     = false;
 unsigned long _autoExtendAt = 0;
 const unsigned long AUTO_EXTEND_FAN_OFF_WAIT_MS = 5000UL;
@@ -165,6 +166,7 @@ void streamTimeoutCallback(bool timeout);
 void rejectCommandAndRevert(const char* reason, unsigned long clientTs);
 void rejectFanCommandAndRevert(const char* reason, unsigned long clientTs);
 void createNotification(String title, String body, String type, String category, String trigger, String action, String priority);
+void sendPushNotification(String title, String body, String type, String category, String action, String priority);
 void fanStreamCallback(FirebaseStream data);
 void fanStreamTimeoutCallback(bool timeout);
 void settingsStreamCallback(FirebaseStream data);
@@ -352,6 +354,41 @@ void startBLEMode() {
 }
 
 // ============================================================
+// SEND PUSH NOTIFICATION — Cloudflare Worker
+// ============================================================
+void sendPushNotification(String title, String body, String type, String category, String action, String priority) {
+  if (bleMode || WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip SSL cert validation — fine for internal use
+
+  HTTPClient http;
+  http.begin(client, CLOUDFLARE_WORKER_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"deviceId\":\"" + DEVICE_ID + "\",";
+  payload += "\"notification\":{";
+  payload += "\"title\":\"" + title + "\",";
+  payload += "\"body\":\"" + body + "\",";
+  payload += "\"type\":\"" + type + "\",";
+  payload += "\"category\":\"" + category + "\",";
+  payload += "\"action\":\"" + action + "\",";
+  payload += "\"priority\":\"" + priority + "\"";
+  payload += "}}";
+
+  int httpCode = http.POST(payload);
+
+  if (httpCode > 0) {
+    Serial.printf("[PUSH] HTTP %d — %s\n", httpCode, http.getString().c_str());
+  } else {
+    Serial.printf("[PUSH] Failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+}
+
+// ============================================================
 // NOTIFICATION HELPER
 // ============================================================
 void createNotification(String title, String body, String type, String category, String trigger, String action, String priority) {
@@ -463,6 +500,7 @@ void streamCallback(FirebaseStream data) {
     releaseOperationLock();
     rejectCommandAndRevert("heavy_rain_detected", clientTs);
     createNotification("Command Blocked", "Cannot extend actuator during heavy rain.", "warning", "system", "user_command_rejected", "command_blocked", "high");
+    sendPushNotification("Command Blocked", "Cannot extend actuator during heavy rain.", "warning", "system", "command_blocked", "high");
     return;
   }
 
@@ -470,6 +508,7 @@ void streamCallback(FirebaseStream data) {
     releaseOperationLock();
     rejectCommandAndRevert("fan_is_on", clientTs);
     createNotification("Command Blocked", "Turn off the drying fan before extending the actuator.", "warning", "system", "user_command_rejected", "command_blocked", "high");
+    sendPushNotification("Command Blocked", "Turn off the drying fan before extending the actuator.", "warning", "system", "command_blocked", "high");
     return;
   }
 
@@ -537,6 +576,7 @@ void fanStreamCallback(FirebaseStream data) {
       releaseOperationLock();
       rejectFanCommandAndRevert("actuator_is_extended", clientTs);
       createNotification("Command Blocked", "Retract the actuator before turning on the drying fan.", "warning", "system", "user_command_rejected", "command_blocked", "high");
+      sendPushNotification("Command Blocked", "Retract the actuator before turning on the drying fan.", "warning", "system", "command_blocked", "high");
       return;
     }
 
@@ -646,6 +686,11 @@ void autoRetractFanOn() {
     "Fan turned on automatically after retraction. Running for 5 minutes.",
     "info", "automation", "auto_retract", "fan_started", "medium"
   );
+  sendPushNotification(
+    "Drying Fan Auto-Started",
+    "Fan turned on automatically after retraction. Running for 5 minutes.",
+    "info", "automation", "fan_started", "medium"
+  );
 
   Serial.printf("[AUTO] Fan ON for %d mins after retraction\n", AUTO_FAN_DURATION_MINS);
 }
@@ -663,6 +708,11 @@ void autoExtendActuator() {
     "Rack Auto-Extended",
     "Weather cleared — rack extended automatically.",
     "info", "automation", "auto_extend", "actuator_extended", "medium"
+  );
+  sendPushNotification(
+    "Rack Auto-Extended",
+    "Weather cleared — rack extended automatically.",
+    "info", "automation", "actuator_extended", "medium"
   );
 
   Serial.println("[AUTO] Actuator extended — weather clear");
@@ -686,7 +736,6 @@ void setup() {
   pinMode(LIGHT_DO, INPUT);
   dht.begin();
 
-  // ── WiFi — 15s timeout, then BLE fallback ─────────────────
   Serial.print("[WiFi] Connecting to: ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
@@ -709,7 +758,6 @@ void setup() {
 
   Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
 
-  // ── NTP Time Sync ─────────────────────────────────────────
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("[NTP] Syncing time");
   struct tm timeinfo;
@@ -737,7 +785,6 @@ void setup() {
   while (!Firebase.ready()) { Serial.print("."); delay(100); }
   Serial.println("\n[Firebase] Ready!");
 
-  // Read autoExtend once on boot before stream starts
   if (Firebase.RTDB.getBool(&fbdo, (SETTINGS_PATH + "/autoExtend").c_str())) {
     _autoExtend = fbdo.boolData();
     Serial.printf("[BOOT] autoExtend = %s\n", _autoExtend ? "true" : "false");
@@ -773,7 +820,6 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ── AUTONOMOUS FAN TIMER CHECK ────────────────────────────
   if (_fanTimerActive && (now - _fanTimerStartedAt >= _fanTimerDurationMs)) {
     _fanTimerActive = false;
     currentFanState = "off";
@@ -783,13 +829,11 @@ void loop() {
     if (bleClientConnected) sendBLEStatus();
   }
 
-  // ── AUTO-RETRACT FAN PENDING (75s after retraction) ──────
   if (_autoRetractFanPending && (now >= _autoRetractFanAt)) {
     _autoRetractFanPending = false;
     autoRetractFanOn();
   }
 
-  // ── AUTO-EXTEND PENDING (5s fan-off wait) ─────────────────
   if (_autoExtendPending && (now >= _autoExtendAt)) {
     _autoExtendPending = false;
     if (_autoExtend &&
@@ -802,7 +846,6 @@ void loop() {
     }
   }
 
-  // ── BLE MODE ──────────────────────────────────────────────
   if (bleMode) {
     if (now - lastSensorUpdate >= SENSOR_INTERVAL) {
       lastSensorUpdate = now;
@@ -868,7 +911,6 @@ void loop() {
 
   previousRainState = currentRainState;
 
-  // ── RAIN STATE MACHINE ────────────────────────────────────
   if (rainVal < RAIN_HEAVY_THRESHOLD) {
     if (currentRainState != RAIN_HEAVY) {
       currentRainState = RAIN_HEAVY;
@@ -879,6 +921,11 @@ void loop() {
           "Heavy Rain Detected!",
           "Actuator retracted due to heavy rainfall.",
           "alert", "weather", "rain_sensor", "actuator_retracted", "high"
+        );
+        sendPushNotification(
+          "Heavy Rain Detected!",
+          "Actuator retracted due to heavy rainfall.",
+          "alert", "weather", "actuator_retracted", "high"
         );
         _autoRetractFanPending = true;
         _autoRetractFanAt      = now + AUTO_FAN_DELAY_MS;
@@ -899,6 +946,11 @@ void loop() {
           "Actuator retracted due to light rain.",
           "info", "weather", "rain_sensor", "actuator_retracted", "medium"
         );
+        sendPushNotification(
+          "Rain Detected",
+          "Actuator retracted due to light rain.",
+          "info", "weather", "actuator_retracted", "medium"
+        );
         _autoRetractFanPending = true;
         _autoRetractFanAt      = now + AUTO_FAN_DELAY_MS;
         Serial.println("[AUTO] Fan scheduled in 75s after retraction");
@@ -908,7 +960,6 @@ void loop() {
     }
   }
   else {
-    // ── NO RAIN — RAIN_NONE ───────────────────────────────
     currentRainState = RAIN_NONE;
 
     if (previousRainState != RAIN_NONE && _autoExtend) {
