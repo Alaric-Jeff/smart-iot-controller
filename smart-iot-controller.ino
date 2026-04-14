@@ -95,9 +95,13 @@ RainState previousRainState = RAIN_NONE;
 String currentFanState = "off";
 
 // ============================================================
-// AUTOMATION FLAGS
+// AUTOMATION FLAGS & COOLDOWN
 // ============================================================
 bool _autoExtend = false;
+
+// COOLDOWN: Prevents swinging between extension and retraction
+unsigned long _autoCooldownEndsAt = 0;
+const unsigned long AUTO_ACTION_COOLDOWN_MS = 40000UL;
 
 bool _autoRetractFanPending     = false;
 unsigned long _autoRetractFanAt = 0;
@@ -146,12 +150,12 @@ void releaseOperationLock() {
 }
 
 // ============================================================
-// EPOCH TIME HELPER
+// EPOCH TIME HELPER (FIXED TO DOUBLE)
 // ============================================================
-long getEpochMs() {
+double getEpochMs() {
   struct timeval tv;
   gettimeofday(&tv, nullptr);
-  return (long)(tv.tv_sec) * 1000L + (tv.tv_usec / 1000);
+  return (double)(tv.tv_sec) * 1000.0 + (double)(tv.tv_usec / 1000.0);
 }
 
 // ============================================================
@@ -173,7 +177,7 @@ void settingsStreamCallback(FirebaseStream data);
 void settingsStreamTimeoutCallback(bool timeout);
 void startFan();
 void stopFan();
-void updateFanCloudState(String state, int durationMins, long timerEndsAt);
+void updateFanCloudState(String state, int durationMins, double timerEndsAt);
 void initFanNodeOnBoot();
 void startBLEMode();
 void sendBLEStatus();
@@ -354,15 +358,22 @@ void startBLEMode() {
 }
 
 // ============================================================
-// SEND PUSH NOTIFICATION — Cloudflare Worker
+// SEND PUSH NOTIFICATION (Heavy-Duty Network Version)
 // ============================================================
 void sendPushNotification(String title, String body, String type, String category, String action, String priority) {
-  if (bleMode || WiFi.status() != WL_CONNECTED) return;
+  if (bleMode || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[PUSH] Aborted — Not connected to WiFi.");
+    return;
+  }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip SSL cert validation — fine for internal use
+  client.setInsecure(); // Skip SSL validation to speed up handshake
 
   HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Ensure Cloudflare routes perfectly
+  http.setTimeout(20000); // 20 SECOND TIMEOUT for terrible internet
+
+  Serial.println("[PUSH] Attempting to connect to Cloudflare...");
   http.begin(client, CLOUDFLARE_WORKER_URL);
   http.addHeader("Content-Type", "application/json");
 
@@ -380,16 +391,16 @@ void sendPushNotification(String title, String body, String type, String categor
   int httpCode = http.POST(payload);
 
   if (httpCode > 0) {
-    Serial.printf("[PUSH] HTTP %d — %s\n", httpCode, http.getString().c_str());
+    Serial.printf("[PUSH] HTTP %d — Response: %s\n", httpCode, http.getString().c_str());
   } else {
-    Serial.printf("[PUSH] Failed: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("[PUSH] FAILED: %s\n", http.errorToString(httpCode).c_str());
   }
 
   http.end();
 }
 
 // ============================================================
-// NOTIFICATION HELPER
+// NOTIFICATION HELPER (FIREBASE ONLY)
 // ============================================================
 void createNotification(String title, String body, String type, String category, String trigger, String action, String priority) {
   if (!Firebase.ready()) return;
@@ -417,7 +428,7 @@ void createNotification(String title, String body, String type, String category,
   notifJson.set("createdAt/.sv", "timestamp");
 
   Firebase.RTDB.pushJSONAsync(&fbdo, NOTIFICATION_PATH.c_str(), &notifJson);
-  Serial.printf("[NOTIFICATION] %s - %s\n", title.c_str(), body.c_str());
+  Serial.printf("[NOTIFICATION] %s\n", title.c_str());
 }
 
 // ============================================================
@@ -589,7 +600,7 @@ void fanStreamCallback(FirebaseStream data) {
       _fanTimerDurationMs = durationMins * 60000UL;
       Serial.printf("[FAN] Timer set for %d mins\n", durationMins);
 
-      long endsAtMs = getEpochMs() + (long)_fanTimerDurationMs;
+      double endsAtMs = getEpochMs() + (double)_fanTimerDurationMs;
       updateFanCloudState("on", durationMins, endsAtMs);
     } else {
       if (hasDuration) _fanTimerActive = false;
@@ -623,7 +634,7 @@ void stopFan() {
   Serial.println("[FAN] Fan OFF");
 }
 
-void updateFanCloudState(String state, int durationMins, long timerEndsAt) {
+void updateFanCloudState(String state, int durationMins, double timerEndsAt) {
   if (!Firebase.ready()) return;
   FirebaseJson json;
   json.set("state",  state);
@@ -678,7 +689,7 @@ void autoRetractFanOn() {
 
   startFan();
 
-  long endsAtMs = getEpochMs() + (long)_fanTimerDurationMs;
+  double endsAtMs = getEpochMs() + (double)_fanTimerDurationMs;
   updateFanCloudState("on", AUTO_FAN_DURATION_MINS, endsAtMs);
 
   createNotification(
@@ -820,6 +831,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // ── 1. TIMER EXPIRY ──
   if (_fanTimerActive && (now - _fanTimerStartedAt >= _fanTimerDurationMs)) {
     _fanTimerActive = false;
     currentFanState = "off";
@@ -827,85 +839,66 @@ void loop() {
     Serial.println("[TIMER] Fan timer expired! Fan OFF.");
     if (!bleMode) updateFanCloudState("off", 0, 0);
     if (bleClientConnected) sendBLEStatus();
+
+    createNotification(
+      "Drying Complete",
+      "The drying fan timer has finished and fans are now off.",
+      "success", "automation", "timer_expiry", "fan_stopped", "medium"
+    );
+    sendPushNotification(
+      "Drying Complete",
+      "The drying fan timer has finished and fans are now off.",
+      "success", "automation", "fan_stopped", "medium"
+    );
   }
 
+  // ── 2. AUTO RETRACT FAN (POST-RAIN) ──
   if (_autoRetractFanPending && (now >= _autoRetractFanAt)) {
     _autoRetractFanPending = false;
     autoRetractFanOn();
   }
 
+  // ── 3. AUTO EXTEND (POST 5s WAIT) ──
   if (_autoExtendPending && (now >= _autoExtendAt)) {
-    _autoExtendPending = false;
-    if (_autoExtend &&
-        currentRainState == RAIN_NONE &&
-        currentPhysicalState == "retracted" &&
-        currentFanState == "off") {
-      autoExtendActuator();
+    if (now < _autoCooldownEndsAt) {
+      // Still in cooldown, do nothing, keep pending active for next loop
     } else {
-      Serial.println("[AUTO-EXTEND] Conditions changed during wait — extension cancelled");
+      _autoExtendPending = false;
+      if (_autoExtend &&
+          currentRainState == RAIN_NONE &&
+          currentPhysicalState == "retracted" &&
+          currentFanState == "off") {
+        autoExtendActuator();
+      } else {
+        Serial.println("[AUTO-EXTEND] Conditions changed during wait — extension cancelled");
+      }
     }
   }
 
-  if (bleMode) {
-    if (now - lastSensorUpdate >= SENSOR_INTERVAL) {
-      lastSensorUpdate = now;
-      float t     = dht.readTemperature();
-      float h     = dht.readHumidity();
-      int   rain  = analogRead(RAIN_AO);
-      int   light = analogRead(LIGHT_AO);
-      if (!isnan(t)) lastTemp     = t;
-      if (!isnan(h)) lastHumidity = h;
-      lastRainVal = rain; lastLightVal = light;
-      Serial.printf("[BLE SENSORS] T:%.1f H:%.1f Rain:%d Light:%d\n", t, h, rain, light);
-      if (bleClientConnected) sendBLEStatus();
-    }
-
-    int  rainVal = analogRead(RAIN_AO);
-    bool rainDig = digitalRead(RAIN_DO) == LOW;
-
-    previousRainState = currentRainState;
-
-    if (rainVal < RAIN_HEAVY_THRESHOLD) {
-      currentRainState = RAIN_HEAVY;
-      if (previousRainState != RAIN_HEAVY && currentPhysicalState != "retracted") {
-        retractActuatorInternal("rain_heavy");
-      }
-    } else if (rainVal < RAIN_LIGHT_THRESHOLD || rainDig) {
-      currentRainState = RAIN_LIGHT;
-      if (previousRainState != RAIN_LIGHT && currentPhysicalState != "retracted") {
-        retractActuatorInternal("rain_light");
-      }
-    } else {
-      currentRainState = RAIN_NONE;
-    }
-
-    if (bleClientConnected && (currentRainState != previousRainState)) {
-      sendBLEStatus();
-    }
-
-    delay(10);
-    return;
-  }
-
-  // ── WIFI/FIREBASE MODE ────────────────────────────────────
+  // ── 4. SENSORS (10s INTERVAL) ──
   if (now - lastSensorUpdate >= SENSOR_INTERVAL) {
     lastSensorUpdate = now;
     float t     = dht.readTemperature();
     float h     = dht.readHumidity();
     int   rain  = analogRead(RAIN_AO);
     int   light = analogRead(LIGHT_AO);
-    if (isnan(t)) t = 0;
-    if (isnan(h)) h = 0;
-    lastTemp = t; lastHumidity = h; lastRainVal = rain; lastLightVal = light;
+    if (!isnan(t)) lastTemp     = t;
+    if (!isnan(h)) lastHumidity = h;
+    lastRainVal = rain; lastLightVal = light;
     Serial.printf("[SENSORS] T:%.1f H:%.1f Rain:%d Light:%d\n", t, h, rain, light);
 
-    FirebaseJson json;
-    json.set("temperature", t); json.set("humidity", h);
-    json.set("rainAO", rain);   json.set("light", light);
-    json.set("updatedAt/.sv", "timestamp");
-    if (Firebase.ready()) Firebase.RTDB.updateNodeAsync(&fbdo, SENSOR_PATH.c_str(), &json);
+    if (bleMode && bleClientConnected) {
+      sendBLEStatus();
+    } else if (!bleMode) {
+      FirebaseJson json;
+      json.set("temperature", t); json.set("humidity", h);
+      json.set("rainAO", rain);   json.set("light", light);
+      json.set("updatedAt/.sv", "timestamp");
+      if (Firebase.ready()) Firebase.RTDB.updateNodeAsync(&fbdo, SENSOR_PATH.c_str(), &json);
+    }
   }
 
+  // ── 5. RAIN STATE EVALUATION ──
   int  rainVal = analogRead(RAIN_AO);
   bool rainDig = digitalRead(RAIN_DO) == LOW;
 
@@ -915,7 +908,7 @@ void loop() {
     if (currentRainState != RAIN_HEAVY) {
       currentRainState = RAIN_HEAVY;
 
-      if (currentPhysicalState != "retracted") {
+      if (currentPhysicalState != "retracted" && now >= _autoCooldownEndsAt) {
         retractActuatorInternal("rain_heavy");
         createNotification(
           "Heavy Rain Detected!",
@@ -939,7 +932,7 @@ void loop() {
     if (currentRainState != RAIN_LIGHT) {
       currentRainState = RAIN_LIGHT;
 
-      if (currentPhysicalState != "retracted") {
+      if (currentPhysicalState != "retracted" && now >= _autoCooldownEndsAt) {
         retractActuatorInternal("rain_light");
         createNotification(
           "Rain Detected",
@@ -962,24 +955,23 @@ void loop() {
   else {
     currentRainState = RAIN_NONE;
 
-    if (previousRainState != RAIN_NONE && _autoExtend) {
-      Serial.println("[AUTO-EXTEND] Rain cleared — evaluating auto-extend");
+    // FIXED: Replaced transition check with State Check
+    if (!bleMode && _autoExtend && currentPhysicalState == "retracted" && !_autoExtendPending && now >= _autoCooldownEndsAt) {
+      Serial.println("[AUTO-EXTEND] Weather is clear — evaluating auto-extend");
 
-      if (currentPhysicalState == "retracted") {
-        if (currentFanState == "on") {
-          currentFanState = "off";
-          _fanTimerActive = false;
-          stopFan();
-          updateFanCloudState("off", 0, 0);
+      if (currentFanState == "on") {
+        currentFanState = "off";
+        _fanTimerActive = false;
+        stopFan();
+        updateFanCloudState("off", 0, 0);
 
-          _autoExtendPending = true;
-          _autoExtendAt      = now + AUTO_EXTEND_FAN_OFF_WAIT_MS;
-          Serial.println("[AUTO-EXTEND] Fan turned off — extending in 5s");
-        } else {
-          _autoExtendPending = true;
-          _autoExtendAt      = now;
-          Serial.println("[AUTO-EXTEND] Fan already off — extending now");
-        }
+        _autoExtendPending = true;
+        _autoExtendAt      = now + AUTO_EXTEND_FAN_OFF_WAIT_MS;
+        Serial.println("[AUTO-EXTEND] Fan turned off — extending in 5s");
+      } else {
+        _autoExtendPending = true;
+        _autoExtendAt      = now; 
+        Serial.println("[AUTO-EXTEND] Fan already off — extending now");
       }
     }
   }
@@ -1025,6 +1017,9 @@ void extendActuatorInternal(const char* source) {
   currentPhysicalState = "extended";
   if (!bleMode) updateCloudState("extended", source);
   Serial.println("[ACTUATOR] Extended");
+
+  // SET COOLDOWN
+  _autoCooldownEndsAt = millis() + AUTO_ACTION_COOLDOWN_MS;
 }
 
 void retractActuatorInternal(const char* source) {
@@ -1034,4 +1029,7 @@ void retractActuatorInternal(const char* source) {
   currentPhysicalState = "retracted";
   if (!bleMode) updateCloudState("retracted", source);
   Serial.println("[ACTUATOR] Retracted");
+
+  // SET COOLDOWN
+  _autoCooldownEndsAt = millis() + AUTO_ACTION_COOLDOWN_MS;
 }
